@@ -4,7 +4,6 @@ import { db } from "./firebase";
 import { collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc } from "firebase/firestore";
 import ChatTab from "./ChatTab";
 import ProspectsTab from "./ProspectsTab";
-import Radar from "./Radar";
 import { T, METRIC, ZONE_PALETTE, STATUTS, FONTS_IMPORT, F_DISPLAY, F_BODY, F_MONO, fmt, fmtK, todayStr, dateLabel } from "./theme";
 
 const MEDALS = ["①","②","③"];
@@ -151,6 +150,44 @@ export default function App() {
     return { panier, caJour, contactsJour, caContact, best };
   }, [totals, distinctDays, statsBySp]);
 
+  // Tendance : compare la période sélectionnée à la période équivalente précédente
+  const trend = useMemo(() => {
+    const caNow = totals.ca;
+    let prevCA = 0;
+    if (period.type === "day") {
+      const d = new Date(period.date+"T12:00:00"); d.setDate(d.getDate()-1);
+      const prev = d.toISOString().slice(0,10);
+      prevCA = entries.filter(e=>e.date===prev && (filterZone==="all"||e.zoneId===filterZone)).reduce((a,e)=>a+e.ca,0);
+    } else if (period.type === "range") {
+      const from=new Date(period.from+"T12:00:00"), to=new Date(period.to+"T12:00:00");
+      const span = Math.max(1, Math.round((to-from)/86400000)+1);
+      const pTo=new Date(from); pTo.setDate(pTo.getDate()-1);
+      const pFrom=new Date(pTo); pFrom.setDate(pFrom.getDate()-span+1);
+      const pf=pFrom.toISOString().slice(0,10), pt=pTo.toISOString().slice(0,10);
+      prevCA = entries.filter(e=>e.date>=pf && e.date<=pt && (filterZone==="all"||e.zoneId===filterZone)).reduce((a,e)=>a+e.ca,0);
+    } else {
+      // "Tout" : compare la dernière moitié des jours à la première moitié
+      const days=[...new Set(chartData.map(d=>d.date))].sort();
+      if(days.length>=2){const mid=Math.floor(days.length/2);const firstHalf=days.slice(0,mid),secondHalf=days.slice(mid);
+        const sum=(arr)=>chartData.filter(d=>arr.includes(d.date)).reduce((a,d)=>a+d.ca,0);
+        prevCA=sum(firstHalf); return { pct: prevCA>0?Math.round(((sum(secondHalf)-prevCA)/prevCA)*100):null, hasPrev:prevCA>0 };
+      }
+      return { pct:null, hasPrev:false };
+    }
+    return { pct: prevCA>0?Math.round(((caNow-prevCA)/prevCA)*100):null, hasPrev:prevCA>0 };
+  }, [totals.ca, period, entries, filterZone, chartData]);
+
+  // Données sparkline (CA cumulé ou par jour)
+  const sparkPath = useMemo(() => {
+    const pts = chartData.map(d=>d.ca);
+    if(pts.length<2) return null;
+    const max=Math.max(...pts,1), min=Math.min(...pts,0);
+    const W=90, H=44, range=max-min||1;
+    const coords = pts.map((v,i)=>{ const x=(i/(pts.length-1))*W; const y=H-((v-min)/range)*H; return [x,y]; });
+    const path = coords.map((p,i)=>`${i===0?"M":"L"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
+    return { path, last:coords[coords.length-1] };
+  }, [chartData]);
+
   const addSP = async () => { const n=newName.trim(); if(!n||salespeople.find(s=>s.name.toLowerCase()===n.toLowerCase()))return; setSaving(true); await addDoc(collection(db,"salespeople"),{name:n,target_contacts:0,target_rdv:0,target_ca:0}); setNewName(""); setSaving(false); };
   const delSP = async (id) => { await deleteDoc(doc(db,"salespeople",id)); await Promise.all(entries.filter(e=>e.salespersonId===id).map(e=>deleteDoc(doc(db,"entries",e.id)))); };
   const updTarget = async (id,f,v) => { await updateDoc(doc(db,"salespeople",id),{[f]:parseFloat(v)||0}); };
@@ -251,47 +288,35 @@ export default function App() {
         {/* ═══ QG / DASHBOARD ═══ */}
         {tab==="dashboard" && (
           <div className="rise">
-            {/* Hero radar */}
-            <div style={{ background:`radial-gradient(ellipse at top, ${T.bgCardHi}, ${T.bgSoft})`, border:`1px solid ${T.line}`, borderRadius:24, padding:"22px 18px 26px", marginBottom:16, position:"relative", overflow:"hidden" }}>
-              <div style={{ position:"absolute", top:-40, right:-40, width:160, height:160, background:T.lime, borderRadius:"50%", filter:"blur(80px)", opacity:0.12 }} />
-              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:6 }}>
-                <div>
-                  <div style={{ fontSize:10, color:T.inkFaint, fontFamily:F_MONO, letterSpacing:2 }}>POSTE DE COMMANDEMENT</div>
-                  <div style={{ fontSize:13, color:T.lime, fontFamily:F_MONO, marginTop:2 }}>● {periodLabel}</div>
-                </div>
-                <div style={{ textAlign:"right" }}>
-                  <div style={{ fontSize:10, color:T.inkFaint, fontFamily:F_MONO }}>CONV.</div>
-                  <div style={{ fontSize:18, fontWeight:700, fontFamily:F_DISPLAY, color:T.lime }}>{totals.contacts>0?((totals.rdv/totals.contacts)*100).toFixed(0):0}%</div>
-                </div>
-              </div>
-              <Radar totals={totals} targets={teamTargets} />
-              {/* Legend */}
-              <div style={{ display:"flex", justifyContent:"center", gap:18, marginTop:8 }}>
-                {[["Contacts",T.cyan,totals.contacts],["RDV",T.violet,totals.rdv],["CA",T.amber,null]].map(([l,c,v]) => (
-                  <div key={l} style={{ display:"flex", alignItems:"center", gap:6 }}>
-                    <span style={{ width:8, height:8, borderRadius:2, background:c }} />
-                    <span style={{ fontSize:11, color:T.inkSoft, fontFamily:F_MONO }}>{l}{v!==null?` ${v}`:""}</span>
+            {/* Hero — CA clé + tendance (Proposition C) */}
+            <div style={{ background:`radial-gradient(ellipse at top right, ${T.bgCardHi}, ${T.bgSoft})`, border:`1px solid ${T.line}`, borderRadius:22, padding:"20px 20px 18px", marginBottom:14, position:"relative", overflow:"hidden" }}>
+              <div style={{ position:"absolute", top:-40, right:-30, width:150, height:150, background:T.lime, borderRadius:"50%", filter:"blur(80px)", opacity:0.1 }} />
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", position:"relative" }}>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:10, color:T.inkFaint, fontFamily:F_MONO, letterSpacing:2, marginBottom:8 }}>€ CA ÉQUIPE · {periodLabel.toUpperCase()}</div>
+                  <div style={{ fontSize:44, fontWeight:700, fontFamily:F_DISPLAY, color:T.ink, lineHeight:0.9, letterSpacing:-1 }}>{new Intl.NumberFormat("fr-FR").format(totals.ca)}<span style={{ fontSize:24, color:T.inkSoft }}> €</span></div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:12, flexWrap:"wrap" }}>
+                    {trend.hasPrev && trend.pct!==null ? (
+                      <span style={{ background:trend.pct>=0?`${T.emerald}22`:`${T.rose}22`, color:trend.pct>=0?T.emerald:T.rose, fontSize:12, fontWeight:700, padding:"3px 10px", borderRadius:8, fontFamily:F_MONO }}>{trend.pct>=0?"▲":"▼"} {trend.pct>=0?"+":""}{trend.pct}%</span>
+                    ) : (
+                      <span style={{ background:T.bgCard, color:T.inkFaint, fontSize:12, fontWeight:600, padding:"3px 10px", borderRadius:8, fontFamily:F_MONO }}>—</span>
+                    )}
+                    <span style={{ fontSize:11, color:T.inkFaint }}>{period.type==="all"?"tendance récente":"vs période précédente"}</span>
                   </div>
-                ))}
-              </div>
-            </div>
-
-            {/* CA Équipe — bandeau hero lisible */}
-            <div style={{ background:`linear-gradient(135deg,${T.amber}1A,${T.bgCard})`, border:`1px solid ${T.amber}44`, borderRadius:18, padding:"18px 20px", marginBottom:14, position:"relative", overflow:"hidden" }}>
-              <div style={{ position:"absolute", top:-30, right:-20, width:120, height:120, background:T.amber, borderRadius:"50%", filter:"blur(70px)", opacity:0.18 }} />
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", position:"relative" }}>
-                <div>
-                  <div style={{ fontSize:10, color:T.amber, fontFamily:F_MONO, letterSpacing:2, marginBottom:6 }}>€ CHIFFRE D'AFFAIRES ÉQUIPE</div>
-                  <div style={{ fontSize:38, fontWeight:700, fontFamily:F_DISPLAY, color:T.ink, lineHeight:1 }}>{fmt(totals.ca)}</div>
-                  {teamTargets.ca>0 && <div style={{ fontSize:12, color:T.inkSoft, marginTop:6, fontFamily:F_MONO }}>{Math.round((totals.ca/teamTargets.ca)*100)}% de l'objectif ({fmtK(teamTargets.ca)})</div>}
                 </div>
-                <div style={{ width:54, height:54, borderRadius:16, background:`${T.amber}22`, border:`1px solid ${T.amber}44`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:26, flexShrink:0 }}>💶</div>
+                {sparkPath && (
+                  <svg width="90" height="44" viewBox="0 0 90 44" style={{ flexShrink:0, marginTop:18, overflow:"visible" }}>
+                    <path d={sparkPath.path} fill="none" stroke={T.lime} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ filter:`drop-shadow(0 0 4px ${T.lime}88)` }} />
+                    <circle cx={sparkPath.last[0]} cy={sparkPath.last[1]} r="4" fill={T.lime} />
+                  </svg>
+                )}
               </div>
-              {teamTargets.ca>0 && (
-                <div style={{ height:6, background:T.bg, borderRadius:3, overflow:"hidden", marginTop:14 }}>
-                  <div style={{ height:"100%", width:`${Math.min(100,(totals.ca/teamTargets.ca)*100)}%`, background:T.gradAmber, borderRadius:3, transition:"width .7s", boxShadow:`0 0 10px ${T.amber}66` }} />
-                </div>
-              )}
+              <div style={{ display:"flex", gap:18, marginTop:16, paddingTop:14, borderTop:`1px solid ${T.line}` }}>
+                <div><span style={{ fontSize:16, fontWeight:700, fontFamily:F_DISPLAY, color:T.cyan }}>{totals.contacts}</span> <span style={{ fontSize:11, color:T.inkFaint, fontFamily:F_MONO }}>contacts</span></div>
+                <div><span style={{ fontSize:16, fontWeight:700, fontFamily:F_DISPLAY, color:T.violet }}>{totals.rdv}</span> <span style={{ fontSize:11, color:T.inkFaint, fontFamily:F_MONO }}>RDV</span></div>
+                <div><span style={{ fontSize:16, fontWeight:700, fontFamily:F_DISPLAY, color:T.lime }}>{totals.contacts>0?((totals.rdv/totals.contacts)*100).toFixed(0):0}%</span> <span style={{ fontSize:11, color:T.inkFaint, fontFamily:F_MONO }}>conv.</span></div>
+                {teamTargets.ca>0 && <div style={{ marginLeft:"auto" }}><span style={{ fontSize:16, fontWeight:700, fontFamily:F_DISPLAY, color:T.amber }}>{Math.round((totals.ca/teamTargets.ca)*100)}%</span> <span style={{ fontSize:11, color:T.inkFaint, fontFamily:F_MONO }}>obj.</span></div>}
+              </div>
             </div>
 
             {/* KPIs visuels — grille 2 colonnes */}
